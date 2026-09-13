@@ -1,5 +1,5 @@
 import logging
-from enum import Enum, auto
+from handgame.gui.screen import Screen
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QStackedWidget, 
@@ -7,20 +7,14 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Slot
 
+from handgame.gui.screens.settings import SettingWindow
+from handgame.gui.ui.ui_shell import Ui_MainWindow
+from handgame.gui.screens.main_menu import MainMenu
+from handgame.gui.screens.game_select import GameSelectWindow
+
 logger = logging.getLogger("HandGame2")
 
-# =====================================================================
-# 1. ENUM DEFINING AVAILABLE SCREENS (GUI-CORE-4)
-# =====================================================================
-class Screen(Enum):
-    MAIN_MENU = 0
-    GAME_SELECT = 1
-    SETTINGS = 2
-    CAMERA_CALIBRATION = 3
-    DEMO_MODE = 4
-    DEV_MODE = 5
-    RESULTS = 6
-    GAME_VIEW = 7
+
 
 
 # =====================================================================
@@ -57,7 +51,7 @@ class MainWindow(QMainWindow):
         # Target RPi resolution / optimization
         self.resize(1024, 768)
         self.setMinimumSize(800, 600)
-
+        
         # 1. Init core modules (GUI-CORE-8)
         self._init_core_modules()
 
@@ -80,20 +74,33 @@ class MainWindow(QMainWindow):
     def _init_ui(self):
         """Builds the main app shell (QStackedWidget)."""
         # Central widget (base for everything)
-        self.central_widget = QWidget()
-        self.setCentralWidget(self.central_widget)
+        self.ui = Ui_MainWindow()
+        self.ui.setupUi(self)
+        self.windowGeometry = None
+        self.router = self.ui.stackedWidget
+        screen = self.screen()
+        available = screen.availableGeometry()
 
-        # Main app layout
-        self.main_layout = QVBoxLayout(self.central_widget)
-        self.main_layout.setContentsMargins(0, 0, 0, 0) # No margins around app
 
-        # Screen router
-        self.router = QStackedWidget()
-        self.main_layout.addWidget(self.router)
+        startWidth = min(1280, available.width())
+        startHeight = min(720, available.height())
 
-        # Add screens to router
+        self.resize(startWidth, startHeight)
+        self.move(available.center()-self.frameGeometry().center())
+
         self._register_screens()
 
+        self._history = []
+        self._currentPage: str | None = None
+
+        self.ui.settingsButton.clicked.connect(lambda: self.change_screen(Screen.SETTINGS))
+        self.ui.backButton.clicked.connect(lambda: self.goBack())
+        # Add screens to router
+        
+
+        self.settings_screen.resolutionChange.connect(self._on_resolution_change)
+        self.settings_screen.fullScreenRequest.connect(self._on_fullscreen_request)
+        self.main_menu_screen.requestPage.connect(self.change_screen)
         # Set start screen
         self.change_screen(Screen.MAIN_MENU)
 
@@ -103,11 +110,13 @@ class MainWindow(QMainWindow):
         
         # Kamil will wire in his real classes here:
         # e.g. self.main_menu = MainMenu(router_callback=self.change_screen)
-        
+        self.main_menu_screen = MainMenu()
+        self.settings_screen = SettingWindow()
+        self.game_select = GameSelectWindow()
         self.screens = {
-            Screen.MAIN_MENU: DummyScreen("Menu Główne", self.change_screen),
-            Screen.GAME_SELECT: DummyScreen("Wybór Gry", self.change_screen),
-            Screen.SETTINGS: DummyScreen("Ustawienia", self.change_screen),
+            Screen.MAIN_MENU: self.main_menu_screen,
+            Screen.GAME_SELECT:  DummyScreen("Wybór gry", self.change_screen),#self.game_select,
+            Screen.SETTINGS: self.settings_screen,
             Screen.CAMERA_CALIBRATION: DummyScreen("Kalibracja Kamery", self.change_screen),
             Screen.DEMO_MODE: DummyScreen("Tryb Demonstracyjny", self.change_screen),
             Screen.DEV_MODE: DummyScreen("Tryb Developerski", self.change_screen),
@@ -119,6 +128,42 @@ class MainWindow(QMainWindow):
         for screen_enum in Screen:
             if screen_enum in self.screens:
                 self.router.addWidget(self.screens[screen_enum])
+    def _keepOnScreen(self) -> None:
+        screen = self.screen()
+        available = screen.availableGeometry()
+        frame = self.frameGeometry()
+
+        x=frame.x()
+        y=frame.y()
+
+        if frame.right()>available.right():
+            x=available.right() - frame.width() + 1
+        if frame.bottom() > available.bottom():
+            y = available.bottom() - frame.height() + 1
+        if x < available.left():
+            x = available.left()
+        if y < available.top():
+            y = available.top()
+        self.move(x,y)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_F11 and self.isFullScreen():
+            self.showNormal()
+            self.setGeometry(self.windowGeometry)
+            self.settings_screen.ui.fullScreenCheckBox.setChecked(False) 
+        elif event.key() == Qt.Key.Key_F11 and not self.isFullScreen():
+            self.windowGeometry = self.geometry()
+            self.showFullScreen()
+            self.settings_screen.ui.fullScreenCheckBox.setChecked(True) 
+        else:
+            super().keyPressEvent(event)
+
+    def goBack(self) -> None:
+        if not self._history:
+            return
+        prevId = self._history.pop()
+        self._currentPage = prevId
+        self.router.setCurrentIndex(prevId)
 
     # =====================================================================
     # CONTROL METHODS (ROUTER AND STATE)
@@ -126,8 +171,16 @@ class MainWindow(QMainWindow):
     @Slot(Screen)
     def change_screen(self, screen: Screen):
         """Switches the currently displayed screen."""
+        if screen is Screen.SETTINGS:
+            self.settings_screen.setResolution(self.width(), self.height())
         logger.info(f"Przełączanie ekranu na: {screen.name}")
         self.router.setCurrentIndex(screen.value)
+        if screen.value == self._currentPage:
+            return
+        if self._currentPage is not None:
+            self._history.append(self._currentPage)
+        self._currentPage = screen.value
+
 
     @Slot()
     def emergency_reset(self):
@@ -162,3 +215,24 @@ class MainWindow(QMainWindow):
             # self.camera_manager.release_all()
             
         logger.info("Wszystkie zasoby zostały prawidłowo zwolnione.")
+    # =====================================================================
+    # SETTINGS
+    # =====================================================================
+    @Slot(int, int)
+    def _on_resolution_change(self, width: int, height: int):
+        if self.isFullScreen():
+            self.showNormal()
+        screen = self.screen()
+        available = screen.availableGeometry()
+        frame = self.frameGeometry()
+        heightDiff = frame.height() - self.height()
+        widthDiff = frame.width() - self.width()
+        width = min(width, available.width()-widthDiff)
+        height = min(height, available.height()-heightDiff)
+        
+        self.resize(width, height)
+        self.windowGeometry = self.geometry()
+        self._keepOnScreen()
+    @Slot()
+    def _on_fullscreen_request(self):
+        self.showFullScreen()
